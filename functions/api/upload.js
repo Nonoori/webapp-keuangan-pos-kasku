@@ -6,20 +6,37 @@ export async function onRequestPost(context) {
   };
 
   try {
-    const incomingForm = await request.formData();
-    const file = incomingForm.get('file');
-    const fileName = incomingForm.get('fileName') || `bukti-${Date.now()}.webp`;
-
-    if (!file) {
-      return new Response(JSON.stringify({ error: 'File foto tidak ditemukan' }), { status: 400, headers });
+    const privateKey = (env.IMAGEKIT_PRIVATE_KEY || '').trim();
+    if (!privateKey) {
+      return new Response(
+        JSON.stringify({ error: 'IMAGEKIT_PRIVATE_KEY belum terbaca di Environment Variables Cloudflare Pages.' }),
+        { status: 500, headers }
+      );
     }
 
-    const ikForm = new FormData();
-    ikForm.append('file', file);
-    ikForm.append('fileName', fileName);
-    ikForm.append('folder', '/kasku-bukti');
+    const incomingForm = await request.formData();
+    const file = incomingForm.get('file');
+    const rawName = incomingForm.get('fileName') || (file && file.name) || `lampiran-${Date.now()}`;
+    const safeFileName = rawName.replace(/[^a-zA-Z0-9._-]/g, '_');
 
-    const authHeader = 'Basic ' + btoa(`${env.IMAGEKIT_PRIVATE_KEY}:`);
+    if (!file || typeof file === 'string') {
+      return new Response(
+        JSON.stringify({ error: 'File tidak ditemukan dalam permintaan unggahan.' }),
+        { status: 400, headers }
+      );
+    }
+
+    // Ubah ke ArrayBuffer lalu Blob baru agar pengiriman ke ImageKit tidak macet (stall)
+    const arrayBuffer = await file.arrayBuffer();
+    const cleanBlob = new Blob([arrayBuffer], { type: file.type || 'application/octet-stream' });
+
+    const ikForm = new FormData();
+    ikForm.append('file', cleanBlob, safeFileName);
+    ikForm.append('fileName', safeFileName);
+    ikForm.append('folder', '/kasku-bukti');
+    ikForm.append('useUniqueFileName', 'true');
+
+    const authHeader = 'Basic ' + btoa(`${privateKey}:`);
 
     const ikRes = await fetch('https://upload.imagekit.io/api/v1/files/upload', {
       method: 'POST',
@@ -29,14 +46,36 @@ export async function onRequestPost(context) {
       body: ikForm
     });
 
-    const ikData = await ikRes.json();
-    if (!ikRes.ok) {
-      return new Response(JSON.stringify({ error: ikData.message || 'Gagal upload ke ImageKit' }), { status: 500, headers });
+    const ikText = await ikRes.text();
+    let ikData;
+    try {
+      ikData = JSON.parse(ikText);
+    } catch (_) {
+      return new Response(
+        JSON.stringify({ error: `Respons ImageKit tidak valid (${ikRes.status}): ${ikText.slice(0, 150)}` }),
+        { status: 502, headers }
+      );
     }
 
-    return new Response(JSON.stringify({ publicUrl: ikData.url }), { headers });
+    if (!ikRes.ok) {
+      return new Response(
+        JSON.stringify({ error: ikData.message || `Gagal upload ke ImageKit (Status ${ikRes.status})` }),
+        { status: 500, headers }
+      );
+    }
+
+    return new Response(
+      JSON.stringify({
+        publicUrl: ikData.url,
+        fileType: ikData.fileType || 'non-image',
+        name: ikData.name
+      }),
+      { headers }
+    );
   } catch (err) {
-    return new Response(JSON.stringify({ error: err.message }), { status: 500, headers });
+    return new Response(
+      JSON.stringify({ error: 'Server Upload Error: ' + err.message }),
+      { status: 500, headers }
+    );
   }
 }
-
